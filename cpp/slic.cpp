@@ -1,12 +1,12 @@
 /****************************************************************************
 **
-** Copyright (C) 2020 Harlen Batagelo <hbatagelo@gmail.com> and
-**                    João Paulo Gois <jpgois@gmail.com>.
+** Copyright (C) 2020-2022 Harlen Batagelo <hbatagelo@gmail.com>,
+**                         João Paulo Gois <jpgois@gmail.com>.
 **
 ** This file is part of the implementation of the paper
 ** 'Laplacian Coordinates: Theory and Methods for Seeded Image Segmentation'
 ** by Wallace Casaca, João Paulo Gois, Harlen Batagelo, Gabriel Taubin and
-** Luis Gustavo Nonato.
+** Luis Gustavo Nonato. DOI 10.1109/TPAMI.2020.2974475.
 **
 ** This program is free software: you can redistribute it and/or modify
 ** it under the terms of the GNU General Public License as published by
@@ -23,511 +23,370 @@
 **
 ****************************************************************************/
 
+#include "slic.h"
+
 #include <QtConcurrent>
 
-#include "slic.h"
 #include "util.h"
 
-SLIC::SLIC(QImage *image,
-           int superpixelSize,
-           double compactness,
-           int numIterations) :
-    m_image(image),
-    m_superpixelSize(superpixelSize),
-    m_compactness(compactness),
-    m_numIterations(numIterations)
-{
-    m_width = m_image->width();
-    m_height = m_image->height();
-    m_pixelCount = m_width * m_height;
+namespace lc {
 
-    ConvertImageToSLICVec();
+SLIC::SLIC(QImage const *image, int superpixelSize, double compactness,
+           int numIterations)
+    : m_image{image},
+      m_width{image->width()},
+      m_height{image->height()},
+      m_numPixels{m_width * m_height},
+      m_superpixelSize{superpixelSize},
+      m_compactness{compactness},
+      m_numIterations{numIterations} {
+  Q_ASSERT(image != nullptr);
+
+  m_imageVec.clear();
+  m_imageVec.reserve(m_numPixels);
+
+  auto *st{reinterpret_cast<QRgb const *>(m_image->bits())};
+  std::span imageSpan{st, static_cast<std::size_t>(m_numPixels)};
+  for (auto const &p : imageSpan) {
+    auto const color{QColor{QRgb{p}}};
+    m_imageVec.emplace_back(
+        0, Eigen::Vector2d{},
+        Eigen::Vector3d{color.redF(), color.greenF(), color.blueF()},
+        Eigen::Vector3d{});
+  }
+
+  auto kernel{[](Center &sc) {
+    using Lab_t = std::remove_reference_t<decltype(*sc.m_Lab.data())>;
+    RGBToLab(std::span<Lab_t, 3>{sc.m_Lab.data(), 3});
+
+    sc.m_normLab << sc.m_Lab.x() / 100.0, (sc.m_Lab.y() + 100.0) / 200.0,
+        (sc.m_Lab.z() + 100.0) / 200.0;
+  }};
+
+  auto future{QtConcurrent::map(m_imageVec.begin(), m_imageVec.end(), kernel)};
+  future.waitForFinished();
 }
 
-void SLIC::ConvertImageToSLICVec()
-{
-    m_imageVec.clear();
-    m_imageVec.resize(m_pixelCount);
+void SLIC::ComputeLabels() {
+  DetectLabEdges();
+  ComputeHexSeeds();
+  ComputeSuperpixels();
+  UpdateConnectivity();
+}
 
-    auto st = reinterpret_cast<QRgb *>(m_image->bits());
-    for (int p = 0; p < m_pixelCount; ++p)
-        m_imageVec[p] = SLICCenter(QColor(st[p]));
+void SLIC::ComputeHexSeeds() {
+  std::array const neighborOffsets{
+      Eigen::Vector2i{-1, 0}, Eigen::Vector2i{-1, -1}, Eigen::Vector2i{0, -1},
+      Eigen::Vector2i{1, -1}, Eigen::Vector2i{1, 0},   Eigen::Vector2i{1, 1},
+      Eigen::Vector2i{0, 1},  Eigen::Vector2i{-1, 1}};
 
-    auto future = QtConcurrent::map(m_imageVec.begin(), m_imageVec.end(),
-        [&] (SLICCenter &sc) { ConvertImageToSLICVecKernel(sc); });
+  m_step = static_cast<int>(std::round(std::sqrt(m_superpixelSize)));
+
+  auto xStrips{
+      static_cast<int>(std::round(static_cast<double>(m_width) / m_step))};
+  auto yStrips{
+      static_cast<int>(std::round(static_cast<double>(m_height) / m_step))};
+
+  auto xErr{m_width - m_step * xStrips};
+  if (xErr < 0) xErr = m_width - m_step * --xStrips;
+
+  auto yErr{m_height - m_step * yStrips};
+  if (yErr < 0) yErr = m_height - m_step * --yStrips;
+
+  m_seeds.clear();
+  m_seeds.reserve(static_cast<std::size_t>(xStrips) * yStrips);
+
+  auto const xErrPerStrip{static_cast<double>(xErr) / xStrips};
+  auto const yErrPerStrip{static_cast<double>(yErr) / yStrips};
+  auto const xOffset{m_step / 2};
+  auto const yOffset{xOffset};
+  auto const wm1{m_width - 1};
+  for (auto y{0}; y < yStrips; ++y) {
+    auto const ye{static_cast<int>(y * yErrPerStrip)};
+    for (auto x{0}; x < xStrips; ++x) {
+      auto const xe{static_cast<int>(x * xErrPerStrip)};
+      auto const seedx{std::min(
+          x * m_step +
+              static_cast<int>(static_cast<unsigned int>(xOffset)
+                               << (static_cast<unsigned int>(y) & 0x1U)) +
+              xe,
+          wm1)};
+      auto const seedy{y * m_step + yOffset + ye};
+
+      Center sc{m_imageVec[seedy * m_width + seedx]};
+      sc.m_index = m_seeds.size();
+      sc.m_position = {seedx, seedy};
+
+      m_seeds.push_back(std::move(sc));
+    }
+  }
+
+  Eigen::Vector2i const imageSize{m_width, m_height};
+  for (auto &seed : m_seeds) {
+    Eigen::Vector2i const originalPos{seed.m_position.cast<int>()};
+    auto const originalIndex{originalPos.y() * m_width + originalPos.x()};
+
+    auto savedIndex{originalIndex};
+    for (auto const &offset : neighborOffsets) {
+      Eigen::Vector2i newPos{originalPos + offset};
+
+      if (inBounds(newPos, Eigen::Vector2i{0, 0}, imageSize)) {
+        auto const newIndex{newPos.y() * m_width + newPos.x()};
+        if (m_labEdges[newIndex] < m_labEdges[savedIndex])
+          savedIndex = newIndex;
+      }
+    }
+    if (savedIndex != originalIndex) {
+      seed.m_Lab = m_imageVec[savedIndex].m_Lab;
+      seed.m_position = {savedIndex % m_width, savedIndex / m_width};
+    }
+  }
+}
+
+void SLIC::DetectLabEdges() {
+  m_labEdges.clear();
+  m_labEdges.resize(static_cast<size_t>(m_numPixels), -1.0);
+
+  auto offset{m_width + 1};
+  for (auto i{1}; i < m_height - 1; ++i) {
+    for (auto j{1}; j < m_width - 1; ++j) {
+      m_labEdges[offset] = offset;
+      ++offset;
+    }
+    offset += 2;
+  }
+
+  auto kernel{[this](double &index) {
+    if (index < 0.0) return;
+    auto const i{static_cast<int>(index)};
+    auto const &w{m_width};
+    auto const dx{(m_imageVec[i - 1].m_Lab - m_imageVec[i + 1].m_Lab).array()};
+    auto const dy{(m_imageVec[i - w].m_Lab - m_imageVec[i + w].m_Lab).array()};
+    auto const dx2s{dx.square().sum()};
+    auto const dy2s{dy.square().sum()};
+    index = dx2s * dx2s + dy2s * dy2s;
+  }};
+
+  auto future{QtConcurrent::map(m_labEdges.begin(), m_labEdges.end(), kernel)};
+  future.waitForFinished();
+}
+
+void SLIC::ComputeSuperpixels() {
+  auto const numSeeds{static_cast<int>(m_seeds.size())};
+  auto const stepByComp{m_step / m_compactness};
+  auto const invWeight{1.0 / (stepByComp * stepByComp)};
+
+  std::vector<double> clusterSize(numSeeds, 0);
+  std::vector<double> distVec(m_numPixels, 0);
+  std::vector<double> inv(numSeeds, 0);
+  std::vector<Center> sigma(numSeeds);
+
+  m_pixelLabels.resize(m_numPixels, 0);
+
+  auto kernel{[&](auto const &seed) {
+    auto const &seedPos{seed.m_position};
+    auto const x1{std::max(0, static_cast<int>(seedPos.x() - m_step))};
+    auto const y1{std::max(0, static_cast<int>(seedPos.y() - m_step))};
+    auto const x2{std::min(m_width, static_cast<int>(seedPos.x() + m_step))};
+    auto const y2{std::min(m_height, static_cast<int>(seedPos.y() + m_step))};
+
+    for (auto y{y1}; y < y2; ++y) {
+      auto const offset{y * m_width};
+      for (auto x{x1}; x < x2; ++x) {
+        auto const i{offset + x};
+
+        auto const LabDiff{m_imageVec[i].m_Lab - seed.m_Lab};
+        auto const LabDist{LabDiff.array().square().sum()};
+
+        Eigen::Vector2d const pos{x, y};
+        auto const posDiff{pos - seedPos};
+        auto const posDist{posDiff.array().square().sum()};
+
+        auto const dist{LabDist + posDist * invWeight};
+        // auto const dist{std::sqrt(LabDist) + std::sqrt(posDist * invWeight)};
+
+        if (dist < distVec[i]) {
+          distVec[i] = dist;
+          m_pixelLabels[i] = seed.m_index;
+        }
+      }
+    }
+  }};
+
+  for (auto iteration{0}; iteration < m_numIterations; ++iteration) {
+    distVec.assign(m_numPixels, std::numeric_limits<double>::max());
+
+    auto future{QtConcurrent::map(m_seeds.begin(), m_seeds.end(), kernel)};
     future.waitForFinished();
+
+    sigma.assign(numSeeds, Center{});
+    clusterSize.assign(numSeeds, 0);
+
+    auto index{0};
+    for (auto i{0}; i < m_height; ++i) {
+      for (auto j{0}; j < m_width; ++j) {
+        auto const label{m_pixelLabels[index]};
+        auto const offset{Eigen::Vector2d(j, i)};
+
+        sigma[label].m_Lab += m_imageVec[index].m_Lab;
+        sigma[label].m_position += offset;
+
+        clusterSize[label] += 1.0;
+        ++index;
+      }
+    }
+
+    for (auto k{0}; k < numSeeds; ++k) {
+      if (clusterSize[k] <= 0) clusterSize[k] = 1;
+      inv[k] = 1.0 / clusterSize[k];
+    }
+
+    for (auto k{0}; k < numSeeds; ++k) {
+      m_seeds[k].m_Lab = sigma[k].m_Lab * inv[k];
+      m_seeds[k].m_position = sigma[k].m_position * inv[k];
+    }
+  }
 }
 
-void SLIC::ConvertImageToSLICVecKernel(SLICCenter &sc)
-{
-    QColor qColor;
-    qColor.setRgbF(sc.m_d[0], sc.m_d[1], sc.m_d[2]);
+void SLIC::ComputeGraph(const QImage *seedsImage, QColor foreground,
+                        QColor background) {
+  std::array const neighborOffsets{
+      Eigen::Vector2i{-1, 0}, Eigen::Vector2i{0, -1}, Eigen::Vector2i{1, 0},
+      Eigen::Vector2i{0, 1}};
 
-    auto color = Color(qColor);
-    sc.m_d[0] = color.getLab_L();
-    sc.m_d[1] = color.getLab_a();
-    sc.m_d[2] = color.getLab_b();
+  Eigen::Vector2i const imageSize{m_width, m_height};
 
-    sc.m_nd[0] = sc.m_d[0] / 100.0;
-    sc.m_nd[1] = (sc.m_d[1] + 100.0) / 200.0;
-    sc.m_nd[2] = (sc.m_d[2] + 100.0) / 200.0;
+  m_labelNodes.clear();
+  m_labelNodes.resize(m_numLabels, SLICNode{});
+
+  for (auto i{0}, index{0}; i < m_height; ++i, index += m_width) {
+    for (auto j{0}; j < m_width; ++j) {
+      auto const label{m_pixelLabels[index + j]};
+      SLICNode &node{m_labelNodes[label]};
+
+      // Add current pixel to superpixel node
+      QColor const pixelColor{seedsImage->pixelColor(j, i)};
+      auto seedType{SeedType::None};
+      if (pixelColor == foreground)
+        seedType = SeedType::Foreground;
+      else if (pixelColor == background)
+        seedType = SeedType::Background;
+      node.AddPixel(Eigen::Vector2i{j, i}, seedType);
+
+      Eigen::Vector2i const pixel{j, i};
+      // Find adjacent label
+      for (auto const &offset : neighborOffsets) {
+        Eigen::Vector2i pos{pixel + offset};
+        if (inBounds(pos, Eigen::Vector2i{0, 0}, imageSize)) {
+          auto const neighborLabel{m_pixelLabels[pos.y() * m_width + pos.x()]};
+          if (neighborLabel != label) {
+            // A neighbor has been found. Update both
+            node.AddNeighbor(neighborLabel);
+            m_labelNodes[neighborLabel].AddNeighbor(label);
+          }
+        }
+      }
+    }
+  }
+
+  // Update center of mass and valency
+  m_minVertexValency = std::numeric_limits<int>::max();
+  m_maxVertexValency = 0;
+  for (auto &labelNode : m_labelNodes) {
+    labelNode.UpdateCenterOfMass();
+    auto const numNeighbors{static_cast<int>(labelNode.GetNeighbors().size())};
+    m_maxVertexValency = std::max(m_maxVertexValency, numNeighbors);
+    m_minVertexValency = std::min(m_minVertexValency, numNeighbors);
+  }
+
+  // Simple voting scheme for deciding whether a superpixel is seeded
+  // as foreground or background
+  for (auto &labelNode : m_labelNodes) {
+    auto const numFgPixels{labelNode.GetNumForegroundPixels()};
+    auto const numBgPixels{labelNode.GetNumBackgroundPixels()};
+
+    if (numFgPixels + numBgPixels > 0) {
+      // This is a foreground superpixel if the number of internal
+      // foreground pixels is greater than the number of background
+      // pixels (and vice-versa)
+      labelNode.SetSeedType(numFgPixels > numBgPixels ? SeedType::Foreground
+                                                      : SeedType::Background);
+    }
+  }
 }
 
-void SLIC::ComputeLabels()
-{
-    DetectLabEdges();
-    ComputeHexSeeds();
-    ComputeSuperpixels();    
-    UpdateConnectivity();
+void SLIC::ComputeFeatures() {
+  for (auto &labelNode : m_labelNodes) {
+    Eigen::Vector3i sum{Eigen::Vector3i::Zero()};
+    for (auto const &pt : labelNode.GetInnerPixels()) {
+      QRgb const qRGB{m_image->pixel(pt.x(), pt.y())};
+      sum += Eigen::Vector3i{qRed(qRGB), qGreen(qRGB), qBlue(qRGB)};
+    }
+    sum /= static_cast<int>(labelNode.GetInnerPixels().size());
+    labelNode.SetFeatureVector(sum.cast<double>() / 255.0);
+  }
 }
 
-void SLIC::SetPixelsLabel(int labelId, const std::vector<QPoint> &pixels)
-{
-    for (const auto& pt : pixels)
-    {
-        m_pixelLabels[pt.y() * m_width + pt.x()] = labelId;
+void SLIC::UpdateConnectivity() {
+  std::array const neighborOffsets{
+      Eigen::Vector2i{-1, 0}, Eigen::Vector2i{0, -1}, Eigen::Vector2i{1, 0},
+      Eigen::Vector2i{0, 1}};
+  auto const numSuperpixels{
+      static_cast<int>(m_numPixels / static_cast<double>(m_step * m_step))};
+  auto const segmentSizeLimit{m_numPixels / numSuperpixels /
+                              neighborOffsets.size()};
+  Eigen::Vector2i const imageSize{m_width, m_height};
+
+  std::vector<int> newLabels;
+  newLabels.resize(m_numPixels, -1);
+
+  auto newNumLabels{0};
+  auto adjacentLabel{0};
+  std::vector<Eigen::Vector2i> posVec(m_numPixels);
+  for (auto pixelIndex{0}; pixelIndex < m_numPixels; ++pixelIndex) {
+    if (newLabels[pixelIndex] >= 0) continue;
+
+    posVec.front() = {pixelIndex % m_width, pixelIndex / m_width};
+    newLabels[pixelIndex] = newNumLabels;
+
+    for (auto const &offset : neighborOffsets) {
+      Eigen::Vector2i pos{posVec.front() + offset};
+
+      if (inBounds(pos, Eigen::Vector2i{0, 0}, imageSize)) {
+        auto const neighborIndex{pos.y() * m_width + pos.x()};
+        if (newLabels[neighborIndex] >= 0)
+          adjacentLabel = newLabels[neighborIndex];
+      }
     }
+
+    auto labelSize{1};
+    for (auto k{0}; k < labelSize; ++k) {
+      for (auto const &offset : neighborOffsets) {
+        Eigen::Vector2i pos{posVec[k] + offset};
+
+        if (inBounds(pos, Eigen::Vector2i{0, 0}, imageSize)) {
+          auto const neighborIndex{pos.y() * m_width + pos.x()};
+          if (newLabels[neighborIndex] >= 0) continue;
+
+          if (m_pixelLabels[pixelIndex] == m_pixelLabels[neighborIndex]) {
+            posVec[labelSize++] = pos;
+            newLabels[neighborIndex] = newNumLabels;
+          }
+        }
+      }
+    }
+
+    if (labelSize <= segmentSizeLimit) {
+      for (auto const &pos : std::ranges::take_view{posVec, labelSize}) {
+        newLabels[pos.y() * m_width + pos.x()] = adjacentLabel;
+      }
+    } else {
+      ++newNumLabels;
+    }
+  }
+
+  m_numLabels = newNumLabels;
+  m_pixelLabels = newLabels;
 }
 
-void SLIC::ComputeHexSeeds()
-{
-    const int neighbors = 8;
-    const int dx8[8] = { -1, -1,  0,  1, 1, 1, 0, -1 };
-    const int dy8[8] = {  0, -1, -1, -1, 0, 1, 1,  1 };
-
-    m_step = static_cast<int>(std::sqrt(m_superpixelSize) + 0.5);
-
-    auto xStrips = static_cast<int>(0.5 + double(m_width) / m_step);
-    auto yStrips = static_cast<int>(0.5 + double(m_height) / m_step);
-
-    auto xErr = m_width - m_step * xStrips;
-    if (xErr < 0)
-        xErr = m_width - m_step * --xStrips;
-
-    auto yErr = m_height - m_step * yStrips;
-    if (yErr < 0)
-        yErr = m_height - m_step * --yStrips;
-
-    auto xErrPerStrip = double(xErr) / xStrips;
-    auto yErrPerStrip = double(yErr) / yStrips;
-
-    int xOffset = m_step / 2;
-    int yOffset = m_step / 2;
-
-    m_seeds.clear();
-    m_seeds.reserve(xStrips * yStrips);
-
-    for (auto y = 0; y < yStrips; ++y)
-    {
-        auto ye = static_cast<int>(y * yErrPerStrip);
-        for (auto x = 0; x < xStrips; ++x)
-        {
-            auto xe = static_cast<int>(x * xErrPerStrip);
-            auto seedx = std::min(x * m_step + (xOffset << (y & 0x1)) + xe, m_width - 1);
-            auto seedy = (y * m_step + yOffset + ye);
-
-            SLICCenter sc = m_imageVec[seedy * m_width + seedx];
-            sc.m_d[3] = seedx;
-            sc.m_d[4] = seedy;
-
-            m_seeds.push_back(sc);
-        }
-    }
-
-    for (auto &seed : m_seeds)
-    {
-        auto originalPos = QPoint(seed.m_d[3], seed.m_d[4]);
-        auto originalIndex = originalPos.y() * m_width + originalPos.x();
-
-        auto savedIndex = originalIndex;
-        for (auto i = 0; i < neighbors; ++i)
-        {
-            auto newPos = originalPos + QPoint(dx8[i], dy8[i]);
-
-            if (inBounds(newPos, QPoint(0, 0), QPoint(m_width, m_height)))
-            {
-                auto newIndex = newPos.y() * m_width + newPos.x();
-                if (m_labEdges[newIndex] < m_labEdges[savedIndex])
-                    savedIndex = newIndex;
-            }
-        }
-        if (savedIndex != originalIndex)
-        {
-            seed.m_d = {
-                m_imageVec[savedIndex].m_d[0],
-                m_imageVec[savedIndex].m_d[1],
-                m_imageVec[savedIndex].m_d[2],
-                double(savedIndex % m_width),
-                double(savedIndex / m_width)
-            };
-        }
-    }
-}
-
-void SLIC::DetectLabEdges()
-{
-    m_labEdges.clear();
-    m_labEdges.resize(m_width * m_height, -1);
-
-    for (auto i = 1; i < m_height - 1; ++i)
-    {
-        auto offset = i * m_width;
-        for (auto j = 1; j < m_width - 1; ++j)
-        {
-            auto tmp = offset + j;
-            m_labEdges[tmp] = tmp;
-        }
-    }
-
-    auto future = QtConcurrent::map(m_labEdges.begin(), m_labEdges.end(),
-        [&] (double &ind) { DetectLabEdgesKernel(ind); });
-    future.waitForFinished();
-}
-
-void SLIC::DetectLabEdgesKernel(double &index)
-{
-    if (index < 0)
-        return;
-
-    int i = index;
-
-    auto im1 = i - 1;
-    auto ip1 = i + 1;
-    auto imw = i - m_width;
-    auto ipw = i + m_width;
-
-    auto dx = 0.0, dy = 0.0;
-    for (auto j = 0; j < 3; ++j)
-    {
-        auto vm1 = m_imageVec[im1].m_d[j];
-        auto vp1 = m_imageVec[ip1].m_d[j];
-        auto vmw = m_imageVec[imw].m_d[j];
-        auto vpw = m_imageVec[ipw].m_d[j];
-        dx += (vm1 - vp1) * (vm1 - vp1);
-        dy += (vmw - vpw) * (vmw - vpw);
-    }
-
-    index = dx * dx + dy * dy;
-}
-
-void SLIC::SLICThread(int startK, int numK)
-{
-    auto stepByComp = m_step / m_compactness;
-    auto invWeight = 1.0 / (stepByComp * stepByComp);
-
-    for (auto n = startK; n < numK; ++n)
-    {
-        int y1 = std::max(0.0, m_seeds[n].m_d[4] - m_step);
-        int y2 = std::min(double(m_height), m_seeds[n].m_d[4] + m_step);
-        int x1 = std::max(0.0, m_seeds[n].m_d[3] - m_step);
-        int x2 = std::min(double(m_width),  m_seeds[n].m_d[3] + m_step);
-
-        for (auto y = y1; y < y2; ++y)
-        {
-            int offset = y * m_width;
-            for (auto x = x1; x < x2; ++x)
-            {
-                auto i = offset + x;
-
-                auto l = m_imageVec[i].m_d[0];
-                auto a = m_imageVec[i].m_d[1];
-                auto b = m_imageVec[i].m_d[2];
-
-                auto ls = l - m_seeds[n].m_d[0];
-                auto as = a - m_seeds[n].m_d[1];
-                auto bs = b - m_seeds[n].m_d[2];
-                auto xs = x - m_seeds[n].m_d[3];
-                auto ys = y - m_seeds[n].m_d[4];
-
-                auto dist = std::sqrt((ls * ls) + (as * as) + (bs * bs)
-                                      + (xs * xs) + (ys * ys)
-                                      * invWeight);
-
-                if (dist < m_distVec[i])
-                {
-                    m_distVec[i] = dist;
-                    m_pixelLabels[i] = n;
-                }
-            }
-        }
-    }
-}
-
-void SLIC::ComputeSuperpixels()
-{   
-    int kMeansSteps = m_seeds.size();
-
-    std::vector<double> edgeSum(kMeansSteps, 0);
-    std::vector<double> clusterSize(kMeansSteps, 0);
-    std::vector<double> inv(kMeansSteps, 0);
-
-    std::vector<SLICCenter> sigma(kMeansSteps);
-    m_distVec = std::vector<double>(m_pixelCount, std::numeric_limits<double>::max());
-
-    auto maxThreads = QThread::idealThreadCount();
-    auto centersPerThread = static_cast<int>(std::ceil(kMeansSteps / double(maxThreads)));
-
-    m_pixelLabels.clear();
-    m_pixelLabels.resize(m_pixelCount, 0);
-
-    for (auto iteration = 0; iteration < m_numIterations; ++iteration)
-    {
-        m_distVec.assign(m_pixelCount, std::numeric_limits<qreal>::max());
-
-        auto future = std::make_unique<QFuture<void>[]>(static_cast<size_t>(maxThreads));
-
-        auto centersTotal = kMeansSteps;
-        auto startingK = 0;
-        auto threadCount = 0;
-        while (centersTotal > 0)
-        {
-            // Distribute batch over the thread pool
-            auto centersThisThread = centersPerThread;
-            if (centersTotal - centersPerThread < 0)
-                centersThisThread = centersTotal;
-
-            centersTotal -= centersPerThread;
-
-            future[threadCount] = QtConcurrent::run(this, &SLIC::SLICThread,
-                                                    startingK,
-                                                    startingK + centersThisThread);
-            startingK += centersThisThread;
-
-            threadCount++;
-
-            if (threadCount == maxThreads || centersTotal <= 0)
-            {
-                // Wait until this batch finishes
-                for (auto i = 0; i < threadCount; ++i)
-                    future[i].waitForFinished();
-
-                threadCount = 0;
-            }
-        }
-
-        // Recalculate the centroid and store in the seed values.
-        // Instead of reassigning memory on each iteration, just reset.
-        sigma.assign(kMeansSteps, SLICCenter());
-        clusterSize.assign(kMeansSteps, 0);
-        edgeSum.assign(kMeansSteps, 0);
-
-        auto index = 0;
-        for (auto i = 0; i < m_height; ++i)
-        {
-            for (auto j = 0; j < m_width; ++j)
-            {
-                auto label = m_pixelLabels[index];
-
-                sigma[label].m_d[0] += m_imageVec[index].m_d[0];
-                sigma[label].m_d[1] += m_imageVec[index].m_d[1];
-                sigma[label].m_d[2] += m_imageVec[index].m_d[2];
-                sigma[label].m_d[3] += j;
-                sigma[label].m_d[4] += i;
-
-                edgeSum[label] += m_labEdges[index];
-
-                clusterSize[label] += 1.0;
-                index++;
-            }
-        }
-
-        for (auto k = 0; k < kMeansSteps; ++k)
-        {
-            if(clusterSize[k] <= 0)
-                clusterSize[k] = 1;
-
-            inv[k] = 1.0 / clusterSize[k];
-        }
-
-        for (auto k = 0; k < kMeansSteps; ++k)
-        {
-            for (auto l = 0; l < 5; ++l)
-                m_seeds[k].m_d[l] = sigma[k].m_d[l] * inv[k];
-
-            edgeSum[k] *= inv[k];
-        }
-    }
-}
-
-void SLIC::ComputeGraph(const QImage *seedsImage,
-                        const QColor fgColor,
-                        const QColor bgColor)
-{
-    const int neighbors = 4;
-    const int dx4[neighbors] = { -1,  0,  1,  0 };
-    const int dy4[neighbors] = {  0, -1,  0,  1 };
-
-    m_labelNodes.clear();
-    m_labelNodes.reserve(m_numLabels);
-    for (auto i = 0; i < m_numLabels; ++i)
-    {
-        m_labelNodes.emplace_back(SLICSuperpixelNode(i));
-    }
-
-    for (auto i = 0; i < m_height; ++i)
-    {
-        for (auto j = 0; j < m_width; ++j)
-        {
-            auto index = i * m_width + j;
-            auto labelId = m_pixelLabels[index];
-            SLICSuperpixelNode &node = m_labelNodes[labelId];
-            node.AddPixel(QPoint(j, i));
-
-            // Update number of seeded pixels
-            QColor pixelColor = seedsImage->pixelColor(j, i);
-            if (pixelColor == fgColor)
-                node.AddSeededPixels(true);
-            else if (pixelColor == bgColor)
-                node.AddSeededPixels(false);
-
-            // Find adjacent label
-            for (auto n = 0; n < neighbors; ++n)
-            {
-                QPoint pos = QPoint(j, i) + QPoint(dx4[n], dy4[n]);
-                if (inBounds(pos, QPoint(0, 0), QPoint(m_width, m_height)))
-                {
-                    auto nLabelId = m_pixelLabels[pos.y() * m_width + pos.x()];
-                    if (nLabelId != labelId)
-                    {
-                        // A neighbor has been found. Update both.
-                        node.AddNeighbor(nLabelId);
-                        m_labelNodes[nLabelId].AddNeighbor(labelId);
-                    }
-                }
-            }          
-        }
-    }
-
-    m_minVertexValency = std::numeric_limits<int>::max();
-    m_maxVertexValency = 0;
-
-    // Update center of mass and valency
-    for (auto &labelNode : m_labelNodes)
-    {
-        labelNode.UpdateCenterOfMass();
-
-        auto numNeighbors = labelNode.GetNeighbors().size();
-        if (numNeighbors > m_maxVertexValency)
-            m_maxVertexValency = numNeighbors;
-        if (numNeighbors < m_minVertexValency)
-            m_minVertexValency = numNeighbors;
-    }
-
-    // Simple voting scheme for deciding whether a superpixel is seeded
-    // as foreground or background
-    for (auto &labelNode : m_labelNodes)
-    {
-        auto fgPixels = labelNode.GetNumberOfForegroundPixels();
-        auto bgPixels = labelNode.GetNumberOfBackgroundPixels();
-
-        if (fgPixels + bgPixels > 0)
-        {
-            // This is a foreground superpixel if the number of internal
-            // foreground pixels is greater than the number of background
-            // pixels (and vice-versa)
-            if (fgPixels > bgPixels)
-                labelNode.SetSeedType(1); // Foreground
-            else
-                labelNode.SetSeedType(-1); // Background
-        }
-    }
-}
-
-void SLIC::ComputeFeatures()
-{
-    for (auto &labelNode : m_labelNodes)
-    {
-        labelNode.m_featureVector.setZero(3);
-
-        auto sumR = 0, sumG = 0, sumB = 0;
-        for (const auto &pt : labelNode.GetPixels())
-        {
-            QRgb qRGB = m_image->pixel(pt.x(), pt.y());
-            sumR += qRed(qRGB);
-            sumG += qGreen(qRGB);
-            sumB += qBlue(qRGB);
-        }
-        auto numPixels = labelNode.GetPixels().size();
-        sumR /= numPixels;
-        sumG /= numPixels;
-        sumB /= numPixels;
-
-        labelNode.m_featureVector(0) = sumR / 255.0;
-        labelNode.m_featureVector(1) = sumG / 255.0;
-        labelNode.m_featureVector(2) = sumB / 255.0;
-    }
-}
-
-void SLIC::UpdateConnectivity()
-{   
-    const int neighbors = 4;
-    const int dx4[neighbors] = { -1,  0,  1,  0 };
-    const int dy4[neighbors] = {  0, -1,  0,  1 };
-
-    auto numberOfSuperpixels = static_cast<int>(double(m_pixelCount) / double(m_step * m_step));
-    auto segmentSizeLimit = m_pixelCount / numberOfSuperpixels / neighbors;
-
-    std::vector<int> newLabels;
-    newLabels.resize(m_pixelCount, -1);
-
-    auto newNumLabels = 0;
-    auto posVec = std::make_unique<QPoint[]>(static_cast<size_t>(m_pixelCount));
-    auto adjacentLabel = 0;
-    for (auto pixelIndex = 0; pixelIndex < m_pixelCount; ++pixelIndex)
-    {
-        if (newLabels[pixelIndex] >= 0)
-            continue;
-
-        int i = pixelIndex / m_width;
-        int j = pixelIndex % m_width;
-        posVec[0] = QPoint(j, i);
-        newLabels[pixelIndex] = newNumLabels;
-
-        for (auto n = 0; n < neighbors; ++n)
-        {
-            auto pos = posVec[0] + QPoint(dx4[n], dy4[n]);
-
-            if (inBounds(pos, QPoint(0, 0), QPoint(m_width, m_height)))
-            {
-                auto neighborIndex = pos.y() * m_width + pos.x();
-                if (newLabels[neighborIndex] >= 0)
-                    adjacentLabel = newLabels[neighborIndex];
-            }
-        }
-
-        auto labelSize = 1;
-        for (auto k = 0; k < labelSize; ++k)
-        {
-            for (auto n = 0; n < neighbors; ++n)
-            {
-                auto pos = posVec[k] + QPoint(dx4[n], dy4[n]);
-
-                if (inBounds(pos, QPoint(0, 0), QPoint(m_width, m_height)))
-                {
-                    auto neighborIndex = pos.y() * m_width + pos.x();
-                    if (newLabels[neighborIndex] >= 0)
-                        continue;
-
-                    if (m_pixelLabels[pixelIndex] == m_pixelLabels[neighborIndex])
-                    {
-                        posVec[labelSize++] = pos;
-                        newLabels[neighborIndex] = newNumLabels;
-                    }
-                }
-            }
-        }
-
-        if (labelSize <= segmentSizeLimit)
-        {
-            for (auto k = 0; k < labelSize; ++k)
-            {
-                newLabels[posVec[k].y() * m_width + posVec[k].x()] = adjacentLabel;
-            }
-            newNumLabels--;
-        }
-        newNumLabels++;
-    }
-
-    m_numLabels = newNumLabels;
-    m_pixelLabels = newLabels;
-}
+}  // namespace lc

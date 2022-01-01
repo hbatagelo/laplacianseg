@@ -1,12 +1,12 @@
 /****************************************************************************
 **
-** Copyright (C) 2020 Harlen Batagelo <hbatagelo@gmail.com> and
-**                    João Paulo Gois <jpgois@gmail.com>.
+** Copyright (C) 2020-2022 Harlen Batagelo <hbatagelo@gmail.com>,
+**                         João Paulo Gois <jpgois@gmail.com>.
 **
 ** This file is part of the implementation of the paper
 ** 'Laplacian Coordinates: Theory and Methods for Seeded Image Segmentation'
 ** by Wallace Casaca, João Paulo Gois, Harlen Batagelo, Gabriel Taubin and
-** Luis Gustavo Nonato.
+** Luis Gustavo Nonato. DOI 10.1109/TPAMI.2020.2974475.
 **
 ** This program is free software: you can redistribute it and/or modify
 ** it under the terms of the GNU General Public License as published by
@@ -29,62 +29,54 @@
 #include <Eigen/Core>
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
-#include <Eigen/CholmodSupport>
 #include <QImage>
+#include <opencv2/opencv.hpp>
 
 #include "util.h"
 
-class SeededSegmentationHard
-{
+namespace lc {
+
+class SeededSegmentationHard {
+  using SparseMatrixType = Eigen::SparseMatrix<double>;
+
+  QImage const *m_input;
+  int const m_cols;
+  int const m_rows;
+  int const m_numPixels;
+  double const m_beta;
+
+  // Input image matrix (3 channels)
+  std::array<Eigen::MatrixXd, 3> m_channels{};
+
+  // Seeds matrix (single value per pixel)
+  Eigen::MatrixXi m_seeds;
+
+  // Linear indices of foreground, background and unknown seeds
+  std::vector<int> m_idxForeground, m_idxBackground, m_idxUnknown;
+
+  // Sparse matrix storing the weights
+  SparseMatrixType m_sparseWeights;
+
+  // Sparse matrices minimizing the energy functional
+  SparseMatrixType m_sparseD;
+  SparseMatrixType m_sparseIs;
+  SparseMatrixType m_sparseL;
+
+  Eigen::VectorXd m_solutionVector;
+
+  void SetUpGraphWeightAndSum();
+  void DiffBetweenSumAndWeights();
+  void SolveEnergyFunctional();
+  void GetMaskedImage(cv::Mat const &mask, QImage &output, bool asBinary) const;
+
 public:
-    const QImage* m_image;
-
-    SeededSegmentationHard(QImage *inputImage,
-                           QImage *seedsImage,
-                           QColor fgColor = Qt::red,
-                           QColor bgColor = Qt::blue,
-                           double beta = 500);
-
-    bool Compute();
-    void GetOutput(QImage &outputImage, bool asBinary = false);
-
-private:
-    // Input image matrix (3 channels)
-    Eigen::MatrixXd m_inputImage[3];
-
-    // Sizes of the input image
-    int m_pixelCount;
-    int m_rows;
-    int m_cols;
-
-    double m_beta;
-
-    // Seeds matrix (single value per pixel)
-    Eigen::MatrixXi m_seedsMatrix;
-    std::vector<int> m_idxForeground, m_idxBackground, m_idxUnknown;
-
-    // Sparse matrix storing the weights
-    Eigen::SparseMatrix<double> m_sparseWeights;
-
-    // Sparse matrices minimizing the energy functional
-    Eigen::SparseMatrix<double> m_sparseD;
-    Eigen::SparseMatrix<double> m_sparseIs;
-    Eigen::SparseMatrix<double> m_sparseL;
-
-    Eigen::VectorXd m_solutionVector;
-
-    // Set up the graph weights and store them in a sparse matrix.
-    // Also creates a diagonal sparse matrix with the sum of the
-    // weigths in each row.
-    void SetUpGraphWeightAndSum();
-
-    // Implement the matrix corresponding to sum of the weights
-    // minus the weights.
-    void DiffBetweenSumAndWeights();
-
-    // Solve the energy functional by minimising using Cholesky
-    // factorization algorithm.
-    void SolveHardLinearSystem();
+  SeededSegmentationHard(QImage const *input, QImage const *seeds,
+                         QColor foreground = Qt::red,
+                         QColor background = Qt::blue, double beta = 500.0);
+  void Compute();
+  void GetOutput(QImage &output, bool asBinary = false) const;
 };
+
+} // namespace lc
 
 #endif // SEEDEDSEGMENTATIONHARD_H

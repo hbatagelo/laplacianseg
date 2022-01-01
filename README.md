@@ -1,6 +1,6 @@
 # Laplacian Coordinates for Seeded Image Segmentation
 
-This repository contains implementations of [Laplacian Coordinates: Theory and Methods for Seeded Image Segmentation](https://ieeexplore.ieee.org/document/9000902) by Casaca et al. If you plan to use the code in this repository or any variant of it, please cite the paper.
+This repository contains implementations of [Laplacian Coordinates: Theory and Methods for Seeded Image Segmentation](https://ieeexplore.ieee.org/document/9000902) by Casaca et al., [DOI 10.1109/TPAMI.2020.2974475](https://doi.org/10.1109/TPAMI.2020.2974475). If you plan to use the code in this repository or any variant of it, please cite the paper.
 
 ---
 
@@ -35,7 +35,7 @@ No extra toolboxes or mex-C compilations are required to run this prototype, mak
 
 ### Description
 
-This is a prototype C++ implementation of the Laplacian Coordinates segmentation framework with support to:
+This is a cross-platform C++ implementation of the Laplacian Coordinates segmentation framework with support to:
 - Soft-constrained, pixel-based Laplacian Coordinates (LC).
 - Hard-constrained, pixel-based Laplacian Coordinates (LCH).
 - Soft-constrained, superpixel-based Laplacian Coordinates (SPLC).
@@ -43,12 +43,40 @@ This is a prototype C++ implementation of the Laplacian Coordinates segmentation
 
 ### Build instructions
 
-- Install the dependencies: [Eigen3](https://eigen.tuxfamily.org/dox/) and [OpenCV 3.4](https://opencv.org/releases/).
-- Run the qmake tool from [Qt 5](https://qt.io) in the directory that contains the `lcseg.pro` file. A C++17 compliant compiler is required.
+Install the build tools and dependencies:
+- [Qt 6](https://qt.io).
+- A C++20-compliant compiler.
+- [CMake](https://cmake.org/), [Eigen 3.3](https://eigen.tuxfamily.org/), [OpenCV 4.2](https://opencv.org/) and [SuiteSparse](https://people.engr.tamu.edu/davis/suitesparse.html). On Linux these can be installed using the distribution's package manager.
 
-The build will generate a command-line application called `lcseg`.
+  Ubuntu 20.04 and later / Debian 11 and later:
+  ```
+  sudo apt-get install cmake libeigen3-dev libopencv-dev libsuitesparse-dev
+  ```
+  Fedora 34 and later:
+  ```
+  sudo dnf install cmake eigen3-devel opencv-devel suitesparse-devel blas-devel lapack-devel
+  ```
+  macOS with Homebrew:
+  ```
+  brew install cmake eigen opencv suite-sparse
+  ```
+  For instructions on how to build SuiteSparse on Windows with MSVC, refer to the [suitesparse-metis-for-windows](https://github.com/jlblancoc/suitesparse-metis-for-windows) project.
 
-We tested the build process on Linux with GCC and MAC OS with Clang. It should work on Windows but may require some tweaking of the `lcseg.pro` file, e.g., for updating the OpenCV headers and libraries paths.
+After installing the dependencies, build the project in Qt Creator:
+
+- Open `cpp/CMakeLists.txt` in Qt Creator and configure/build the project from there.
+
+As an alternative, build in the command line:
+- Set `CMAKE_PREFIX_PATH` to the location where Qt 6 is installed (e.g. `$HOME/Qt/6.2.2/gcc_64`).
+- From the `cpp` directory, run the following commands (assuming `Release` build type):
+
+  ```
+  mkdir build
+  cd build
+  cmake -DCMAKE_BUILD_TYPE=Release ..
+  cmake --build . --config "Release"
+  ```
+If a dependency is not found during the CMake configuration, manually set the missing path using the CMake variables `Eigen3_DIR`, `OpenCV_DIR` and `SuiteSparse_DIR`.
 
 ### Usage
 

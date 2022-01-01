@@ -1,12 +1,12 @@
 /****************************************************************************
 **
-** Copyright (C) 2020 Harlen Batagelo <hbatagelo@gmail.com> and
-**                    João Paulo Gois <jpgois@gmail.com>.
+** Copyright (C) 2020-2022 Harlen Batagelo <hbatagelo@gmail.com>,
+**                         João Paulo Gois <jpgois@gmail.com>.
 **
 ** This file is part of the implementation of the paper
 ** 'Laplacian Coordinates: Theory and Methods for Seeded Image Segmentation'
 ** by Wallace Casaca, João Paulo Gois, Harlen Batagelo, Gabriel Taubin and
-** Luis Gustavo Nonato.
+** Luis Gustavo Nonato. DOI 10.1109/TPAMI.2020.2974475.
 **
 ** This program is free software: you can redistribute it and/or modify
 ** it under the terms of the GNU General Public License as published by
@@ -26,43 +26,91 @@
 #ifndef UTIL_H
 #define UTIL_H
 
-#include <QMatrix4x4>
+#include <cmath>
+#include <concepts>
+#include <numeric>
+#include <opencv2/opencv.hpp>
+#include <ranges>
+#include <span>
 
-template <typename T>
-constexpr bool almostEquals(const T& x, const T& y)
-{
-    return std::abs(x - y) <= (std::max(std::abs(x), std::abs(y)) *
-                               std::numeric_limits<T>::epsilon());
+namespace lc {
+
+// In-place RGB to Lab
+template <std::floating_point T> void RGBToLab(std::span<T, 3> RGB) {
+  // Inverse sRGB companding
+  std::array<T, 3> linRGB{};
+  std::ranges::transform(RGB, linRGB.begin(), [](T t) {
+    return t > 0.04045F ? std::pow((t + 0.055F) / 1.055F, 2.4F) : t / 12.92F;
+  });
+
+  // Convert RGB to X (idx=0), Y (idx=1) or Z (idx=2)
+  auto RGBToXYZ{[](auto const &rgb, std::size_t const idx) {
+    // Illuminant = D65 (2°, CIE 1931)
+    static std::array const refWhite{0.95047F, 1.0F, 1.08883F};
+    // RGB->XYZ conversion matrix (sRGB - D65)
+    // clang-format off
+    static std::array const RGBToXYZ{
+      0.4124564F, 0.3575761F, 0.1804375F,
+      0.2126729F, 0.7151522F, 0.0721750F,
+      0.0193339F, 0.1191920F, 0.9503041F};
+    // clang-format on
+    auto const &s{std::span{RGBToXYZ}.subspan(idx * 3, 3)};
+    return std::inner_product(s.begin(), s.end(), rgb.begin(), T{}) /
+           refWhite.at(idx);
+  }};
+  std::array XYZ{RGBToXYZ(linRGB, 0), RGBToXYZ(linRGB, 1), RGBToXYZ(linRGB, 2)};
+
+  // XYZ->Lab
+  std::ranges::transform(XYZ, XYZ.begin(), [](T t) {
+    return t > 0.008856F ? std::pow(t, 1 / 3.0F) : 7.787F * t + (16 / 116.0F);
+  });
+  auto const &[fX, fY, fZ]{XYZ};
+  RGB[0] = 116.0F * fY - 16.0F;
+  RGB[1] = 500.0F * (fX - fY);
+  RGB[2] = 200.0F * (fY - fZ);
+}
+
+template <std::floating_point T>
+constexpr bool almostEquals(T const &a, T const &b) {
+  return std::abs(a - b) <= (std::max(std::abs(a), std::abs(b)) *
+                             std::numeric_limits<T>::epsilon());
 }
 
 template <typename T>
-constexpr bool inBounds(const T& v, const T& lo, const T& hi)
-{
-    return !(v < lo) && (v < hi);
+concept xy_coordinates = requires(T a) {
+  std::is_arithmetic<decltype(a.x())>();
+  std::is_arithmetic<decltype(a.y())>();
+};
+
+template <xy_coordinates T>
+constexpr bool inBounds(T const &p, T const &lo, T const &hi) {
+  return p.x() >= lo.x() && p.x() < hi.x() && p.y() >= lo.y() && p.y() < hi.y();
 }
 
-constexpr bool inBounds(const QPoint& v, const QPoint& lo, const QPoint& hi)
-{
-    return v.x() >= lo.x() && v.x() < hi.x() &&
-           v.y() >= lo.y() && v.y() < hi.y();
+// Apply image thresholding to compute the binary image. If otsuVariant is true,
+// the threshold is given by Isol > (1-otsu) instead of Isol > otsu
+inline cv::Mat ApplyThresholding(cv::Mat const &image, bool otsu = true,
+                                 bool otsuVariant = true) {
+  auto const binary{cv::THRESH_BINARY};
+
+  cv::Mat output(image.size(), image.type());
+
+  if (otsu) {
+    auto const binaryOtsu{binary | cv::THRESH_OTSU};
+    if (otsuVariant) {
+      auto otsuThreshold{cv::threshold(image, output, 0, 255, binaryOtsu)};
+      if (almostEquals(otsuThreshold, 0.0))
+        otsuThreshold = 255;
+      cv::threshold(image, output, 255 - otsuThreshold, 255, binary);
+    } else {
+      cv::threshold(image, output, 0, 255, binaryOtsu);
+    }
+  } else {
+    cv::threshold(image, output, 127, 255, binary);
+  }
+  return output;
 }
 
-
-// Illuminant = D65 (2°, CIE 1931)
-static constexpr QVector3D s_refWhite = QVector3D(0.95047f, 1, 1.08883f);
-
-// RGB-XYZ conversion matrix (sRGB - D65)
-static const QMatrix4x4 s_RGBToXYZ = QMatrix4x4(
-            0.4124564f,  0.3575761f,  0.1804375f, 0,
-            0.2126729f,  0.7151522f,  0.0721750f, 0,
-            0.0193339f,  0.1191920f,  0.9503041f, 0,
-            0,           0,           0,          1);
-
-// XYZ-RGB conversion matrix (sRGB - D65)
-static const QMatrix4x4 s_XYZToRGB = QMatrix4x4(
-            3.2404548f, -1.5371389f, -4.9853155f, 0,
-           -9.6926639f,  1.8760110f,  4.1556082f, 0,
-            5.5643420f, -2.0402585f,  1.0572251f, 0,
-            0,           0,           0,          1);
+} // namespace lc
 
 #endif // UTIL_H

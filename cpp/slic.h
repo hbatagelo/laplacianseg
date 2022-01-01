@@ -1,12 +1,12 @@
 /****************************************************************************
 **
-** Copyright (C) 2020 Harlen Batagelo <hbatagelo@gmail.com> and
-**                    João Paulo Gois <jpgois@gmail.com>.
+** Copyright (C) 2020-2022 Harlen Batagelo <hbatagelo@gmail.com>,
+**                         João Paulo Gois <jpgois@gmail.com>.
 **
 ** This file is part of the implementation of the paper
 ** 'Laplacian Coordinates: Theory and Methods for Seeded Image Segmentation'
 ** by Wallace Casaca, João Paulo Gois, Harlen Batagelo, Gabriel Taubin and
-** Luis Gustavo Nonato.
+** Luis Gustavo Nonato. DOI 10.1109/TPAMI.2020.2974475.
 **
 ** This program is free software: you can redistribute it and/or modify
 ** it under the terms of the GNU General Public License as published by
@@ -26,193 +26,132 @@
 #ifndef SLIC_H
 #define SLIC_H
 
-#include <QImage>
-#include <QPoint>
 #include <Eigen/Core>
+#include <QColor>
+#include <QImage>
 
-#include "color.h"
+#include "util.h"
 
-class SLIC;
+namespace lc {
 
-// A superpixel as a graph node. The node is identified by its
-// label id and a list of neighboring superpixel label ids
-class SLICSuperpixelNode
-{
-    friend class SLIC; // Grant private access to SLIC
+enum class SeedType { None = 0, Background = -1, Foreground = 1 };
+
+// Superpixel graph node
+class SLICNode {
+  friend class SLIC;
+
+  SeedType m_seedType{SeedType::None};
+  int m_numBackgroundPixels{};
+  int m_numForegroundPixels{};
+  std::vector<Eigen::Vector2i> m_pixels; // Pixel coordinates
+  std::vector<int> m_neighbors;          // Index of adjacent superpixels
+  Eigen::Vector2d m_centerOfMass;        // Center of mass w.r.t. m_pixels
+  Eigen::Vector3d m_featureVector{Eigen::Vector3d::Zero()}; // Mean RGB
 
 public:
-    SLICSuperpixelNode(const int& id) : m_id(id)
-    {
-        m_innerPixels.clear();
-        m_centerOfMass = QPointF(0, 0);
-        ResetSeededPixels();
-    }
-
-    // Add a (x, y) pixel coordinates to the list of inner pixels
-    void AddPixel(const QPoint& pt)
-    {
-        m_innerPixels.push_back(pt);
-    }
-
-    // Add a neighbor label if not a neighbor already
-    bool AddNeighbor(const int& id)
-    {
-        if (!IsNeighbor(id))
-        {
-            m_neighbors.push_back(id);
-            return true;
-        }
-        return false;
-    }
-
-    // Is id a neighbor label?
-    bool IsNeighbor(const int& id) const
-    {
-        auto res = std::find(std::begin(m_neighbors), std::end(m_neighbors), id);
-        return res != std::end(m_neighbors);
-    }
-
-    // Compute the center of mass of the inner pixels and reserves
-    // memory for the neighbors' segment pixels
-    void UpdateCenterOfMass()
-    {
-        if (m_innerPixels.size() == 0)
-            return;
-
-        double sumX = 0, sumY = 0;
-        for (const QPoint& pt : m_innerPixels)
-        {
-            sumX += pt.x();
-            sumY += pt.y();
-        }
-        sumX /= static_cast<double>(m_innerPixels.size());
-        sumY /= static_cast<double>(m_innerPixels.size());
-        m_centerOfMass = QPointF(sumX, sumY);
-    }
-
-    void ResetSeededPixels() { m_seededPixels[0] = m_seededPixels[1] = 0; m_seedType = 0; }
-    void AddSeededPixels(bool addToForeground) { m_seededPixels[addToForeground]++; }
-    void SetSeedType(int seedType) { m_seedType = seedType; }
-
-    // Getters
-    const int& GetId() const { return m_id; }
-    const int& GetSeedType() const { return m_seedType; }
-    const int& GetNumberOfBackgroundPixels() const { return m_seededPixels[0]; }
-    const int& GetNumberOfForegroundPixels() const { return m_seededPixels[1]; }
-    const std::vector<int>& GetNeighbors() const { return m_neighbors; }
-    const std::vector<QPoint>& GetPixels() const { return m_innerPixels; }
-    const QPointF& GetCenterOfMass() const { return m_centerOfMass; }
-    const Eigen::VectorXd& GetFeatureVector() const { return m_featureVector; }
+  // Getters
+  [[nodiscard]] SeedType GetSeedType() const { return m_seedType; }
+  [[nodiscard]] int GetNumBackgroundPixels() const {
+    return m_numBackgroundPixels;
+  }
+  [[nodiscard]] int GetNumForegroundPixels() const {
+    return m_numForegroundPixels;
+  }
+  [[nodiscard]] const std::vector<Eigen::Vector2i> &GetInnerPixels() const {
+    return m_pixels;
+  }
+  [[nodiscard]] const std::vector<int> &GetNeighbors() const {
+    return m_neighbors;
+  }
+  [[nodiscard]] const Eigen::Vector2d &GetCenterOfMass() const {
+    return m_centerOfMass;
+  }
+  [[nodiscard]] const Eigen::Vector3d &GetFeatureVector() const {
+    return m_featureVector;
+  }
 
 private:
-    int m_id; // Superpixel label id
-    std::vector<int> m_neighbors; // List of neighboring superpixel label ids
+  // Add coordinates of a pixel to the list of pixels
+  void AddPixel(Eigen::Vector2i const &position, SeedType type) {
+    m_pixels.push_back(position);
+    if (type == SeedType::Background) {
+      ++m_numBackgroundPixels;
+    } else if (type == SeedType::Foreground) {
+      ++m_numForegroundPixels;
+    }
+  }
 
-    // Number of seeded pixels in this superpixel
-    // (used for seeded segmentation)
-    int m_seededPixels[2]; // [0] background pixels, [1] foreground pixels
+  // Add neighbor id if not a neighbor already
+  bool AddNeighbor(int id) {
+    return std::ranges::find(m_neighbors, id) == m_neighbors.end()
+           ? m_neighbors.push_back(id),
+           true : false;
+  }
 
-    // Whether this superpixel is a foreground (1), background (-1) or not
-    // seeded (0) superpixel
-    int m_seedType;   
+  // Compute the center of mass with respect to the pixels
+  void UpdateCenterOfMass() {
+    if (!m_pixels.empty()) {
+      auto sum{std::accumulate(m_pixels.begin(), m_pixels.end(),
+                               Eigen::Vector2i(0, 0))};
+      m_centerOfMass = sum.cast<double>() / m_pixels.size();
+    }
+  }
 
-    // List of (x, y) pixel coordinates of the pixels contained in this
-    // superpixel
-    std::vector<QPoint> m_innerPixels;
-
-    QPointF m_centerOfMass; // Center of mass with respect to m_innerPixels
-
-    // This is the feature vector. Its size depend on the flags used with
-    // SLIC::ComputeSuperpixelFeatures()
-    Eigen::VectorXd m_featureVector; // Mean RGB
+  void SetSeedType(SeedType type) { m_seedType = type; }
+  void SetFeatureVector(Eigen::Vector3d const &featureVector) {
+    m_featureVector = featureVector;
+  }
 };
 
-class SLICCenter
-{
+class SLIC {
+  QImage const *m_image;
+  int const m_width;
+  int const m_height;
+  int const m_numPixels;
+  int const m_superpixelSize;
+  double const m_compactness;
+  int const m_numIterations;
+
+  int m_numLabels{};                  // Number of superpixels
+  std::vector<int> m_pixelLabels;     // Superpixel label for each pixel
+  std::vector<double> m_labEdges;     // Magnitude of gradient of Lab image
+  std::vector<SLICNode> m_labelNodes; // Superpixel label graph
+  int m_minVertexValency{}; // Minimum vertex valency of the superpixel graph
+  int m_maxVertexValency{}; // Maximum vertex valency of the superpixel graph
+
+  struct Center {
+    int m_index{};
+    Eigen::Vector2d m_position{Eigen::Vector2d::Zero()}; // Pixel position
+    Eigen::Vector3d m_Lab{Eigen::Vector3d::Zero()};      // Lab color
+    Eigen::Vector3d m_normLab{Eigen::Vector3d::Zero()};  // Normalized Lab
+  };
+
+  std::vector<Center> m_imageVec;
+  std::vector<Center> m_seeds;
+  int m_step{};
+
 public:
-    std::array<double, 5> m_d; // Color in CIE Lab format + 2D pixel position
-    std::array<double, 3> m_nd; // Normalized Lab
+  explicit SLIC(QImage const *image, int superpixelSize, double compactness,
+                int numIterations = 10);
 
-    SLICCenter() : m_d{0} { }
-    // Workaround constructor to store a QColor instead
-    SLICCenter(const QColor &qColor)
-    {
-        m_d = { qColor.redF(), qColor.greenF(), qColor.blueF() };
-    }
-    // Constructor for CIE Lab color and xy pixel position
-    SLICCenter(const Color &color, const QPoint &point = QPoint(0, 0))
-    {
-        m_d = { static_cast<double>(color.getLab_L()),
-                static_cast<double>(color.getLab_a()),
-                static_cast<double>(color.getLab_b()),
-                static_cast<double>(point.x()),
-                static_cast<double>(point.y()) };
-
-        m_nd[0] = m_d[0] / 100.0;
-        m_nd[1] = (m_d[1] + 100.0) / 200.0;
-        m_nd[2] = (m_d[2] + 100.0) / 200.0;
-    }
-};
-
-class SLIC
-{
-public:
-    SLIC(QImage *image,
-         int superpixelSize = 100,
-         double compactness = 10.0,
-         int numIterations = 10);
-
-    void ComputeLabels();
-    void ComputeGraph(const QImage *seedsImage,
-                      const QColor fgColor = Qt::red,
-                      const QColor bgColor = Qt::blue);
-    void ComputeFeatures();
-    int GetMinVertexValency() const { return m_minVertexValency; }
-    int GetMaxVertexValency() const { return m_maxVertexValency; }
-
-    int GetNumLabels() const { return m_numLabels; }
-    std::vector<SLICSuperpixelNode>& GetLabelNodes() { return m_labelNodes; }
+  void ComputeLabels();
+  void ComputeGraph(QImage const *seeds, QColor foreground = Qt::red,
+                    QColor background = Qt::blue);
+  void ComputeFeatures();
+  [[nodiscard]] int GetMinVertexValency() const { return m_minVertexValency; }
+  [[nodiscard]] int GetMaxVertexValency() const { return m_maxVertexValency; }
+  [[nodiscard]] int GetNumLabels() const { return m_numLabels; }
+  [[nodiscard]] std::vector<SLICNode> const &GetLabelNodes() const {
+    return m_labelNodes;
+  }
 
 private:
-    QImage *m_image;
-
-    int m_width;
-    int m_height;
-    int m_pixelCount; // width x height
-
-    int m_superpixelSize;
-    double m_compactness;
-    int m_numIterations;
-
-    // Number of superpixels
-    int m_numLabels;
-
-    // List of superpixel ids
-    std::vector<int> m_pixelLabels;
-
-    // Magnitude of gradient of Lab image
-    std::vector<double> m_labEdges;
-
-    // List of superpixel nodes (superpixel label graph)
-    std::vector<SLICSuperpixelNode> m_labelNodes;
-
-    int m_minVertexValency = 0; // Minimum vertex valency of the superpixel graph
-    int m_maxVertexValency = 0; // Maximum vertex valency of the superpixel graph
-
-    std::vector<SLICCenter> m_imageVec;
-    std::vector<SLICCenter> m_seeds;
-    std::vector<double> m_distVec;
-    int m_step;
-
-    void SetPixelsLabel(int labelId, const std::vector<QPoint> &pixels);
-    void ComputeHexSeeds();
-    void ConvertImageToSLICVec();
-    void ConvertImageToSLICVecKernel(SLICCenter &sc);
-    void DetectLabEdges();
-    void DetectLabEdgesKernel(double &ind);
-    void SLICThread(int startK, int numK);
-    void ComputeSuperpixels();
-    void UpdateConnectivity();
+  void ComputeHexSeeds();
+  void DetectLabEdges();
+  void ComputeSuperpixels();
+  void UpdateConnectivity();
 };
+
+} // namespace lc
 
 #endif // SLIC_H

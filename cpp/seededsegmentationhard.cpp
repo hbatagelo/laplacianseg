@@ -1,12 +1,12 @@
 /****************************************************************************
 **
-** Copyright (C) 2020 Harlen Batagelo <hbatagelo@gmail.com> and
-**                    João Paulo Gois <jpgois@gmail.com>.
+** Copyright (C) 2020-2022 Harlen Batagelo <hbatagelo@gmail.com>,
+**                         João Paulo Gois <jpgois@gmail.com>.
 **
 ** This file is part of the implementation of the paper
 ** 'Laplacian Coordinates: Theory and Methods for Seeded Image Segmentation'
 ** by Wallace Casaca, João Paulo Gois, Harlen Batagelo, Gabriel Taubin and
-** Luis Gustavo Nonato.
+** Luis Gustavo Nonato. DOI 10.1109/TPAMI.2020.2974475.
 **
 ** This program is free software: you can redistribute it and/or modify
 ** it under the terms of the GNU General Public License as published by
@@ -23,273 +23,232 @@
 **
 ****************************************************************************/
 
-#include "opencv2/opencv.hpp"
 #include "seededsegmentationhard.h"
 
-SeededSegmentationHard::SeededSegmentationHard(QImage *inputImage,
-                                               QImage *seedsImage,
-                                               QColor fgColor,
-                                               QColor bgColor,
-                                               double beta)
-    : m_image(inputImage),
-      m_beta(beta)
-{
-    m_cols = inputImage->width();
-    m_rows = inputImage->height();
-    m_pixelCount = m_rows * m_cols;
+#include <Eigen/CholmodSupport>
+#include <opencv2/opencv.hpp>
 
-    m_inputImage[0] = Eigen::MatrixXd(m_rows, m_cols);
-    m_inputImage[1] = Eigen::MatrixXd(m_rows, m_cols);
-    m_inputImage[2] = Eigen::MatrixXd(m_rows, m_cols);
-    m_seedsMatrix = Eigen::MatrixXi(m_rows, m_cols);
+namespace lc {
 
-    // Split the different layers of the image and store them in
-    // three Eigen matrices
-    auto stInput = reinterpret_cast<QRgb *>(inputImage->bits());
-    auto stSeeds = reinterpret_cast<QRgb *>(seedsImage->bits());
-    for (auto i = 0; i < m_rows; ++i)
-    {
-        for (auto j = 0; j < m_cols; ++j)
-        {
-            auto offset = i * m_cols + j;
+SeededSegmentationHard::SeededSegmentationHard(QImage const *input,
+                                               QImage const *seeds,
+                                               QColor foreground,
+                                               QColor background, double beta)
+    : m_input{input},
+      m_cols{input->width()},
+      m_rows{input->height()},
+      m_numPixels{m_rows * m_cols},
+      m_beta{beta} {
+  Q_ASSERT(input != nullptr);
+  Q_ASSERT(seeds != nullptr);
 
-            auto inputColor = QColor(stInput[offset]);
-            m_inputImage[0](i, j) = inputColor.redF();
-            m_inputImage[1](i, j) = inputColor.greenF();
-            m_inputImage[2](i, j) = inputColor.blueF();
+  // Split the different layers of the image and store them in three Eigen
+  // matrices
+  m_channels[0] = Eigen::MatrixXd(m_rows, m_cols);
+  m_channels[1] = Eigen::MatrixXd(m_rows, m_cols);
+  m_channels[2] = Eigen::MatrixXd(m_rows, m_cols);
 
-            auto seedColor = QColor(stSeeds[offset]);
-            if (seedColor == fgColor)
-            {
-                m_seedsMatrix(i, j) = 1;
-                m_idxBackground.push_back(offset);
-            }
-            else if (seedColor == bgColor)
-            {
-                m_seedsMatrix(i, j) = 0;
-                m_idxForeground.push_back(offset);
-            }
-            else
-            {
-                m_idxUnknown.push_back(offset);
-                m_seedsMatrix(i, j) = -1;
-            }
-        }
+  for (auto y{0}; y < m_rows; ++y) {
+    for (auto x{0}; x < m_cols; ++x) {
+      auto const color{input->pixelColor(x, y)};
+      m_channels[0](y, x) = color.redF();
+      m_channels[1](y, x) = color.greenF();
+      m_channels[2](y, x) = color.blueF();
     }
+  }
+
+  // Set up seeds matrix
+  m_idxForeground.reserve(m_numPixels);
+  m_idxBackground.reserve(m_numPixels);
+  m_idxUnknown.reserve(m_numPixels);
+  m_seeds = Eigen::MatrixXi(m_rows, m_cols);
+
+  for (auto idx{0}, y{0}; y < m_rows; ++y) {
+    for (auto x{0}; x < m_cols; ++x) {
+      auto const color{seeds->pixelColor(x, y)};
+      if (color == foreground) {
+        m_seeds(y, x) = 1;
+        m_idxBackground.push_back(idx);
+      } else if (color == background) {
+        m_seeds(y, x) = 0;
+        m_idxForeground.push_back(idx);
+      } else {
+        m_seeds(y, x) = -1;
+        m_idxUnknown.push_back(idx);
+      }
+      ++idx;
+    }
+  }
 }
 
-// Initialize the sparse matrices with the number of expected values in
-// each row and instantiate the variables which will help us to compute
-// the graph weight and the sum of the rows
-void SeededSegmentationHard::SetUpGraphWeightAndSum()
-{
-    const double epsilon = 10e-6;
+// Initialize the sparse matrices with the number of expected values in each row
+// and set up the variables which will help us to compute the graph weight and
+// the sum of the rows
+void SeededSegmentationHard::SetUpGraphWeightAndSum() {
+  constexpr auto epsilon{1e-6};
+  constexpr auto epsilonInv{1.0 / epsilon};
 
-    m_sparseWeights = Eigen::SparseMatrix<double>(m_pixelCount, m_pixelCount);
-    m_sparseWeights.reserve(Eigen::VectorXi::Constant(m_pixelCount, 9));
+  std::array const neighborOffsets{
+      Eigen::Vector2i{-1, 0}, Eigen::Vector2i{-1, -1}, Eigen::Vector2i{0, -1},
+      Eigen::Vector2i{1, -1}, Eigen::Vector2i{1, 0},   Eigen::Vector2i{1, 1},
+      Eigen::Vector2i{0, 1},  Eigen::Vector2i{-1, 1}};
 
-    m_sparseD = Eigen::SparseMatrix<double>(m_pixelCount, m_pixelCount);
-    m_sparseD.reserve(Eigen::VectorXi::Constant(m_pixelCount, 1));
+  auto const n{m_numPixels};
+  auto const valency{neighborOffsets.size() + 1};
 
-    // Compute weights of every pixels with their neighbors and uptate the sum
-    // of the row weights at every iterations
-    for (int i = 0; i < m_pixelCount; i++)
-    {
-        // Get row and column of the pixel
-        double summ = 0;
-        int rowPi = i / m_cols;
-        int colPi = i % m_cols;
+  Eigen::Vector2i const boundsLo{0, 0};
+  Eigen::Vector2i const boundsHi{m_rows, m_cols};
 
-        for (int j = 0; j < 9; j++)
-        {
-            // Get row an column of the neighbor
-            int rowPj = rowPi + j / 3 - 1;
-            int colPj = colPi + j % 3 - 1;
+  m_sparseWeights = Eigen::SparseMatrix<double>(n, n);
+  m_sparseWeights.reserve(Eigen::VectorXi::Constant(n, valency));
 
-            int indexJ = (rowPj * m_cols) + colPj;
+  m_sparseD = Eigen::SparseMatrix<double>(n, n);
+  m_sparseD.reserve(Eigen::VectorXi::Constant(n, 1));
 
-            // If neighbor is out of the image bounds or is corresponding to
-            // the same pixel, do nothing
-            if (!(rowPj < 0 || rowPj >= m_rows ||
-                  colPj < 0 || colPj >= m_cols ||
-                  (rowPj == rowPi && colPj == colPi)))
-            {
-                // Compute difference of the values of
-                // each layer between the two pixels
-                Eigen::VectorXd VecDiff(3);
-                for (auto k = 0; k < 3; ++k)
-                {
-                    VecDiff(k) = m_inputImage[k](rowPi, colPi) -
-                            m_inputImage[k](rowPj, colPj);
-                }
-                // Calculate infinity norm of the differences
-                double dist = VecDiff.lpNorm<Eigen::Infinity>();
-                // Compute the weight
-                double wij = std::exp(-m_beta * dist * dist);
-                wij = std::round(wij * 1e6) * 1e-6;
-                wij += epsilon;
-                m_sparseWeights.insert(i, indexJ) = wij;
+  // Compute the weight of each pixel with respect to its neighbors
+  for (auto idx{0}; idx < n; ++idx) {
+    auto summ{0.0};
+    // Pixel row (x) and column (y)
+    Eigen::Vector2i pI{idx / m_cols, idx % m_cols};
 
-                summ += wij;
-            }
-        }
-        // Insert the sum in the diagonal matrix
-        m_sparseD.insert(i, i) = summ;
+    for (auto const &offset : neighborOffsets) {
+      Eigen::Vector2i const pJ{pI + offset};
+
+      if (!inBounds(pJ, boundsLo, boundsHi)) continue;
+
+      // Compute difference of the values of each layer between the two pixels
+      Eigen::Vector3d vecDiff{
+          m_channels[0](pI.x(), pI.y()) - m_channels[0](pJ.x(), pJ.y()),
+          m_channels[1](pI.x(), pI.y()) - m_channels[1](pJ.x(), pJ.y()),
+          m_channels[2](pI.x(), pI.y()) - m_channels[2](pJ.x(), pJ.y())};
+
+      // Calculate infinity norm of the differences
+      auto const dist{vecDiff.lpNorm<Eigen::Infinity>()};
+      // Compute the weight
+      auto wij{std::exp(-m_beta * dist * dist)};
+      wij = std::round(wij * epsilonInv) * epsilon;
+      wij += epsilon;
+      m_sparseWeights.insert(idx, (pJ.x() * m_cols) + pJ.y()) = wij;
+
+      summ += wij;
     }
+
+    // Insert the sum in the diagonal matrix
+    m_sparseD.insert(idx, idx) = summ;
+  }
+
+  m_sparseWeights.makeCompressed();
+  m_sparseD.makeCompressed();
 }
 
 // Compute difference between the row sum of the weights and the weights
-void SeededSegmentationHard::DiffBetweenSumAndWeights()
-{
-    m_sparseL = Eigen::SparseMatrix<double>(m_pixelCount, m_pixelCount);
-    m_sparseL.reserve(Eigen::VectorXi::Constant(m_pixelCount, 9));
-    m_sparseL = m_sparseD - m_sparseWeights;
+void SeededSegmentationHard::DiffBetweenSumAndWeights() {
+  m_sparseL = m_sparseD;
+  m_sparseL -= m_sparseWeights;
 }
 
-bool SeededSegmentationHard::Compute()
-{
-    SetUpGraphWeightAndSum();
-    DiffBetweenSumAndWeights();
-    SolveHardLinearSystem();
-
-    return true;
+void SeededSegmentationHard::Compute() {
+  SetUpGraphWeightAndSum();
+  DiffBetweenSumAndWeights();
+  SolveEnergyFunctional();
 }
 
-void SeededSegmentationHard::SolveHardLinearSystem()
-{
-    std::vector<int> seededidx;
-    seededidx.insert(seededidx.end(), m_idxBackground.begin(), m_idxBackground.end());
-    seededidx.insert(seededidx.end(), m_idxForeground.begin(), m_idxForeground.end());
+// Solve the energy functional for hard seeds
+void SeededSegmentationHard::SolveEnergyFunctional() {
+  std::vector<int> seededIdx;
+  seededIdx.reserve(m_idxForeground.size() + m_idxBackground.size());
+  seededIdx.insert(seededIdx.end(), m_idxBackground.begin(),
+                   m_idxBackground.end());
+  seededIdx.insert(seededIdx.end(), m_idxForeground.begin(),
+                   m_idxForeground.end());
 
-    std::vector<int> vectorpermutation;
-    vectorpermutation.insert(vectorpermutation.end(), seededidx.begin(), seededidx.end());
-    vectorpermutation.insert(vectorpermutation.end(), m_idxUnknown.begin(), m_idxUnknown.end());
+  std::vector<int> permutationVector;
+  permutationVector.reserve(seededIdx.size() + m_idxUnknown.size());
+  permutationVector.insert(permutationVector.end(), seededIdx.begin(),
+                           seededIdx.end());
+  permutationVector.insert(permutationVector.end(), m_idxUnknown.begin(),
+                           m_idxUnknown.end());
 
-    Eigen::VectorXi permutation;
-    permutation = Eigen::Map<Eigen::VectorXi, Eigen::Unaligned>(
-                vectorpermutation.data(),
-                long(vectorpermutation.size()));
-    Eigen::PermutationMatrix<Eigen::Dynamic, Eigen::Dynamic,int> perm(permutation);
+  Eigen::VectorXi const permutation{
+      Eigen::Map<Eigen::VectorXi, Eigen::Unaligned>(
+          permutationVector.data(), long(permutationVector.size()))};
+  Eigen::PermutationMatrix<Eigen::Dynamic, Eigen::Dynamic, int> const perm(
+      permutation);
 
-    Eigen::SparseMatrix<double> spLtwisted;
-    spLtwisted = m_sparseL.twistedBy(perm.transpose());
+  SparseMatrixType spLtwisted;
+  spLtwisted = m_sparseL.twistedBy(perm.transpose());
 
-    auto b_rows = long(seededidx.size());
+  auto const bRows{std::ssize(seededIdx)};
+  SparseMatrixType const sparseLs{spLtwisted.topLeftCorner(bRows, bRows)};
 
-    Eigen::SparseMatrix<double> sparseLs;
-    sparseLs = spLtwisted.topLeftCorner(b_rows, b_rows);
+  auto const bCols{m_sparseL.cols() - bRows};
+  SparseMatrixType const sparseB{spLtwisted.block(0, bRows, bRows, bCols)};
+  SparseMatrixType const sparseBt{sparseB.transpose()};
+  SparseMatrixType const sparseLu{spLtwisted.block(bRows, bRows, bCols, bCols)};
 
-    auto b_cols = m_sparseL.cols() - b_rows;
-    Eigen::SparseMatrix<double> sparseB;
-    sparseB= spLtwisted.block(0, b_rows, b_rows, b_cols);
-    Eigen::SparseMatrix<double> sparseBt = sparseB.transpose();
+  Eigen::VectorXd xs{bRows};
+  xs.setConstant(1);
+  xs.segment(0, std::ssize(m_idxBackground)).setConstant(0);
 
-    Eigen::SparseMatrix<double> sparseLu;
-    sparseLu = spLtwisted.block(b_rows, b_rows, b_cols, b_cols);
+  SparseMatrixType const sparseLHard{sparseBt * sparseB + sparseLu * sparseLu};
+  Eigen::VectorXd const bHard{-(sparseLu * sparseBt + sparseBt * sparseLs) *
+                              xs};
 
-    Eigen::VectorXd xs(seededidx.size());
-    xs.setConstant(1);
-    xs.segment(0, long(m_idxBackground.size())).setConstant(0);
-
-    Eigen::SparseMatrix<double> sparseLHard;
-    sparseLHard = sparseBt * sparseB + sparseLu * sparseLu;
-    Eigen::VectorXd bHard = -(sparseLu * sparseBt + sparseBt * sparseLs) * xs;
-
-    Eigen::CholmodDecomposition<Eigen::SparseMatrix<double>, Eigen::Lower> sparseSolver;
-
-    sparseSolver.setMode(Eigen::CholmodSupernodalLLt);
-    sparseSolver.compute(sparseLHard);
-    m_solutionVector = sparseSolver.solve(bHard);
+  Eigen::CholmodDecomposition<SparseMatrixType, Eigen::Lower> sparseSolver;
+  sparseSolver.setMode(Eigen::CholmodSupernodalLLt);
+  sparseSolver.compute(sparseLHard);
+  m_solutionVector = sparseSolver.solve(bHard);
 }
 
-void SeededSegmentationHard::GetOutput(QImage &outputImage, bool asBinary)
-{
-    int width = m_image->width();
-    int height = m_image->height();
+// Create QImage using thresholded image as mask
+void SeededSegmentationHard::GetMaskedImage(cv::Mat const &mask, QImage &output,
+                                            bool asBinary) const {
+  auto const width{m_input->width()};
+  auto const height{m_input->height()};
 
-    bool otsu = true;
-    // If otsuVariant is true, the threshold is
-    // given by Isol > (1-otsu) instead of Isol > otsu
-    bool otsuVariant = true;
-
-    cv::Mat imBw(height, width, CV_8UC1);
-    cv::Mat imGray(height, width, CV_8UC1);
-
-    // Mount solution vector as an OpenCV matrix
-    for (auto i = 0; i < m_rows; ++i)
-    {
-        for (auto j = 0; j < m_cols; ++j)
-        {
-            double value = 0;
-            int seedType = m_seedsMatrix(i, j);
-            if(seedType == 1)
-                value = 255;
-
-            auto cpt = cv::Point(j, i);
-            imGray.at<uchar>(cpt) = uchar(value);
-        }
+  for (auto i{0}; i < height; ++i) {
+    for (auto j{0}; j < width; ++j) {
+      QColor color;
+      QPoint const qpt{j, i};
+      if (mask.at<unsigned char>(cv::Point(j, i)) == 255)
+        color = asBinary ? QColor(255, 255, 255, 255) : m_input->pixel(qpt);
+      else
+        color = asBinary ? QColor(0, 0, 0, 255) : QColor(0, 0, 0, 0);
+      output.setPixelColor(qpt, color);
     }
-
-    for(int i = 0; i < m_solutionVector.size(); i++)
-    {
-        double value = 1 - m_solutionVector.coeff(i);
-
-        value *= 255.0;
-        value = std::clamp(value, 0.0, 255.0);
-        if (std::isnan(value))
-            value = 0;
-
-        int offset = m_idxUnknown[ulong(i)];
-        int rowPi = offset / m_cols;
-        int colPi = offset % m_cols;
-
-        auto cpt = cv::Point(colPi, rowPi);
-        imGray.at<uchar>(cpt) = uchar(value);
-    }
-
-    // Threshold with Otsu
-    if (otsu)
-    {
-        if (otsuVariant)
-        {
-            double otsuThreshold = cv::threshold(
-                imGray, imBw, 0, 255, CV_THRESH_BINARY | CV_THRESH_OTSU);
-            if (almostEquals(otsuThreshold, 0.0))
-                otsuThreshold = 255;
-
-            cv::threshold(imGray, imBw, 255 - otsuThreshold, 255, CV_THRESH_BINARY);
-        }
-        else
-        {
-            cv::threshold(imGray, imBw, 0, 255, CV_THRESH_BINARY | CV_THRESH_OTSU);
-        }
-    }
-    else
-    {
-        cv::threshold(imGray, imBw, 127, 255, CV_THRESH_BINARY);
-    }
-
-    for (auto i = 0; i < height; ++i)
-    {
-        for (auto j = 0; j < width; ++j)
-        {
-            auto cpt = cv::Point(j, i);
-            auto pt = QPoint(j, i);
-
-            if(imBw.at<uchar>(cpt) == 255)
-            {
-                if (asBinary)
-                    outputImage.setPixelColor(pt, QColor(255,255,255,255));
-                else
-                    outputImage.setPixelColor(pt, m_image->pixel(j,i));
-            }
-            else
-            {
-                if (asBinary)
-                    outputImage.setPixelColor(pt, QColor(0,0,0,255));
-                else
-                    outputImage.setPixelColor(pt, QColor(0,0,0,0));
-            }
-        }
-    }
+  }
 }
+
+void SeededSegmentationHard::GetOutput(QImage &output, bool asBinary) const {
+  auto const width{m_input->width()};
+  auto const height{m_input->height()};
+
+  // Image from solution matrix
+  cv::Mat grayscale(height, width, CV_8UC1);
+  for (auto i{0}; i < m_rows; ++i) {
+    for (auto j{0}; j < m_cols; ++j) {
+      double value{m_seeds(i, j) == 1 ? 255.0 : 0.0};
+      grayscale.at<unsigned char>(cv::Point(j, i)) =
+          static_cast<unsigned char>(value);
+    }
+  }
+
+  for (auto index{0}; index < m_solutionVector.size(); ++index) {
+    auto value{(1.0 - m_solutionVector.coeff(index)) * 255.0};
+
+    value = std::clamp(value, 0.0, 255.0);
+    if (std::isnan(value)) value = 0.0;
+
+    auto const offset{m_idxUnknown[static_cast<std::size_t>(index)]};
+    auto const rowPi{offset / m_cols};
+    auto const colPi{offset % m_cols};
+    grayscale.at<unsigned char>(cv::Point(colPi, rowPi)) =
+        static_cast<unsigned char>(value);
+  }
+
+  auto const mask{ApplyThresholding(grayscale)};
+
+  GetMaskedImage(mask, output, asBinary);
+}
+
+}  // namespace lc

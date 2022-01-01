@@ -1,12 +1,12 @@
 /****************************************************************************
 **
-** Copyright (C) 2020 Harlen Batagelo <hbatagelo@gmail.com> and
-**                    João Paulo Gois <jpgois@gmail.com>.
+** Copyright (C) 2020-2022 Harlen Batagelo <hbatagelo@gmail.com>,
+**                         João Paulo Gois <jpgois@gmail.com>.
 **
 ** This file is part of the implementation of the paper
 ** 'Laplacian Coordinates: Theory and Methods for Seeded Image Segmentation'
 ** by Wallace Casaca, João Paulo Gois, Harlen Batagelo, Gabriel Taubin and
-** Luis Gustavo Nonato.
+** Luis Gustavo Nonato. DOI 10.1109/TPAMI.2020.2974475.
 **
 ** This program is free software: you can redistribute it and/or modify
 ** it under the terms of the GNU General Public License as published by
@@ -27,76 +27,58 @@
 #define SEEDEDSPSEGMENTATION_H
 
 #include <Eigen/Core>
-#include <Eigen/Dense>
 #include <Eigen/Sparse>
-#include <Eigen/CholmodSupport>
 #include <QImage>
+#include <stdexcept>
 
-#include "slic.h"
 #include "opencv2/opencv.hpp"
+#include "slic.h"
 
-class SeededSPSegmentation
-{
-public:
-    SeededSPSegmentation(QImage *inputImage,
-                         QImage *seedsImage,
-                         int superpixelSize,
-                         double compactness);
+namespace lc {
 
-    bool Compute(bool useHardSeeds = false,
-                 QColor fgColor = Qt::red,
-                 QColor bgColor = Qt::blue,
-                 double betaF = 88,
-                 double betaD = -1);
+class SeededSPSegmentation {
+  using SparseMatrixType = Eigen::SparseMatrix<double>;
 
-    void GetOutput(QImage &outputImage, bool asBinary = false);
+  QImage const *m_input;  // Input image
+  QImage const *m_seeds;  // Input seeds image
 
-private:
-    QImage *m_image; // Input image
-    QImage *m_seeds; // Input seeds image
+  SLIC m_slic;
 
-    SLIC m_slic;
+  // Seeds vector (single value per superpixel)
+  Eigen::VectorXd m_seedsVector;
 
-    // Seeds vector (single value per superpixel)
-    Eigen::VectorXd m_seedsVector;
+  // Sparse matrix storing the weights
+  SparseMatrixType m_sparseWeights;
 
-    // Sparse matrix storing the weights
-    Eigen::SparseMatrix<double> m_sparseWeights;
+  // Sparse matrices minimizing the energy functional
+  SparseMatrixType m_sparseD;
+  SparseMatrixType m_sparseIs;
+  SparseMatrixType m_sparseL;
 
-    // All sparse matrices minimizing the energy functional
-    Eigen::SparseMatrix<double> m_sparseD;
-    Eigen::SparseMatrix<double> m_sparseIs;
-    Eigen::SparseMatrix<double> m_sparseL;
+  Eigen::VectorXd m_solutionVector;
 
-    Eigen::VectorXd m_solutionVector;
+  bool m_useHardSeeds{};
 
-    bool m_useHardSeeds;
+  double ComputeDistanceBeta(double betaMin = 0.1, double betaMax = 0.5,
+                             double betaStep = 0.01, bool global = false);
+  void SetUpGraphWeightAndSum(double betaFeatures, double betaDistance);
+  void CheckIfInSeeds();
+  void DiffBetweenSumAndWeights();
+  void SolveEnergyFunctionalSoft();
+  void SolveEnergyFunctionalHard();
+  void RemoveUnlabeledConnectedComponents(cv::Mat const &seeds,
+                                          cv::Mat &mask) const;
+  void GetMaskedImage(cv::Mat const &mask, QImage &output, bool asBinary) const;
 
-    // Returns the beta which results in the largest variation of weights
-    double ComputeDistanceBeta(double betaMin = 0.1,
-                               double betaMax = 0.5,
-                               double betaStep = 0.01,
-                               bool global = false);
-
-    // Set up the graph weights and store them in a sparse matrix
-    // and deliver also a diagonal Sparse Matrix with the sum of the
-    // weigths in each row
-    void SetUpGraphWeightAndSum(double betaFeatures, double betaDistance);
-
-    // Implement the diagonal sparse matrix with ones, if the pixel belongs
-    // to the background or the foreground, and zeros otherwise.
-    void CheckIfInSeedsOrNot();
-
-    // Implement the matrix corresponding to sum of the weights
-    // minus the weights
-    void DiffBetweenSumAndWeights();
-
-    // Solve the energy functional by minimising using Cholesky
-    // factorization algorithm
-    void SolveSoftLinearSystem();
-    void SolveHardLinearSystem();
-
-    bool GetFirstNonZeroPixel(cv::Mat &image, cv::Mat &segImage, cv::Point &point);
+ public:
+  SeededSPSegmentation(QImage const *input, QImage const *seeds,
+                       int superpixelSize, double compactness);
+  void Compute(bool useHardSeeds = false, QColor foreground = Qt::red,
+               QColor background = Qt::blue, double betaFeatures = 88.0,
+               double betaDistance = -1.0);
+  void GetOutput(QImage &output, bool asBinary = false) const;
 };
 
-#endif // SEEDEDSPSEGMENTATION_H
+}  // namespace lc
+
+#endif  // SEEDEDSPSEGMENTATION_H
